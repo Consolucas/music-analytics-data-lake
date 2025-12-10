@@ -1,0 +1,4 @@
+data/
+datalake/
+venv/
+__pycache__/
