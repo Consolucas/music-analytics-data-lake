@@ -1,83 +1,61 @@
 import duckdb
 import os
-import shutil
+from dotenv import load_dotenv
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
-DATA_DIR = f'{BASE_DIR}/data'
-LAKE_DIR = f'{BASE_DIR}/datalake'
+load_dotenv()
 
-print("--- INICIANDO DATA LAKE (VERSÃO BLINDADA) ---")
-
-# Criando pastas
-if os.path.exists(LAKE_DIR):
-    try:
-        shutil.rmtree(LAKE_DIR)
-    except:
-        print("Aviso: Pasta em uso pelo OneDrive. Atualizando arquivos existentes...")
-
-os.makedirs(f"{LAKE_DIR}/bronze", exist_ok=True)
-os.makedirs(f"{LAKE_DIR}/silver", exist_ok=True)
-os.makedirs(f"{LAKE_DIR}/gold", exist_ok=True)
-
+# 1. Configura conexão com S3
 con = duckdb.connect()
+con.sql("INSTALL httpfs; LOAD httpfs;")
+con.sql(f"""
+    CREATE SECRET secret_aws (
+        TYPE S3,
+        KEY_ID '{os.getenv('AWS_ACCESS_KEY_ID')}',
+        SECRET '{os.getenv('AWS_SECRET_ACCESS_KEY')}',
+        REGION '{os.getenv('AWS_REGION')}'
+    );
+""")
 
-# ==============================================================================
-# CAMADA BRONZE
-# ==============================================================================
-print("1. Criando Bronze (CSV -> Parquet)...")
+bucket = os.getenv('BUCKET_NAME')
 
-con.sql(f"COPY (SELECT * FROM read_csv('{DATA_DIR}/Spotify_Youtube.csv', auto_detect=true)) TO '{LAKE_DIR}/bronze/songs.parquet' (FORMAT PARQUET)")
+# ==========================================
+# CAMADA BRONZE -> SILVER (Limpeza)
+# ==========================================
+print("Transformando Bronze (S3) -> Silver (S3)...")
 
-
-# ==============================================================================
-# CAMADA SILVER (A Correção está aqui)
-# ==============================================================================
-print("2. Criando Silver (Limpeza)...")
-
-query_songs = f"""
-    COPY(
-        SELECT column00 AS ID,
-               Artist AS Artista,
-               Track AS Nome_da_musica,
-               Album_type AS Tipo_de_album,
-               Danceability AS Dancante,
-               Energy AS Energetica,
-               Speechiness AS '%_falas',
-               Acousticness AS '%_Acustico',
-               Instrumentalness AS '%_Instrumental',
-               Liveness AS Presenca_de_publico,
-               Valence AS Astral,
-               ROUND(Duration_ms / 1000.0, 0) AS duracao_segundos,
-               Url_youtube
-          FROM read_parquet('{LAKE_DIR}/bronze/songs.parquet')   
-        ) TO '{LAKE_DIR}/silver/songs_clean.parquet' (FORMAT PARQUET)
+# Note que agora lemos de 's3://...' e escrevemos em 's3://...'
+query_silver = f"""
+    COPY (
+        SELECT 
+            Artist AS artista,
+            Track AS musica,
+            Album AS album,
+            -- Exemplo de limpeza: convertendo ms para minutos
+            (Duration_ms / 60000.0) AS duracao_min,
+            Stream AS stream_count
+        FROM read_csv_auto('s3://{bucket}/bronze/*.csv')
+    ) TO 's3://{bucket}/silver/songs_clean.parquet' (FORMAT PARQUET);
 """
+con.sql(query_silver)
 
-con.sql(query_songs)
+# ==========================================
+# CAMADA SILVER -> GOLD (Agregação)
+# ==========================================
+print("Transformando Silver (S3) -> Gold (S3)...")
 
-# ==============================================================================
-# CAMADA GOLD 
-# ==============================================================================
-print("3. Criando Gold (KPI's)...")
-query_kpi = f"""
-    COPY(
-        SELECT
-            Artista,
-            ROUND(AVG(Dancante), 2) AS media_dancante,
-            ROUND(AVG(Energetica), 2) AS media_energia,
-            ROUND(AVG(Astral), 2) AS media_astral,
-            ROUND(AVG("%_Acustico"), 2) AS media_acustico,
-            ROUND(AVG("%_Instrumental"), 2) AS media_instrumental,
-            ROUND(AVG("%_falas"), 2) AS media_letras    
-        FROM read_parquet('{LAKE_DIR}/silver/songs_clean.parquet')
-        GROUP BY Artista
-        ) TO '{LAKE_DIR}/gold/perfil_bandas.parquet' (FORMAT PARQUET) 
+# Lemos o arquivo parquet que acabamos de gerar no S3
+query_gold = f"""
+    COPY (
+        SELECT 
+            artista,
+            AVG(duracao_min) as media_duracao,
+            SUM(stream_count) as total_streams
+        FROM read_parquet('s3://{bucket}/silver/songs_clean.parquet')
+        GROUP BY artista
+        ORDER BY total_streams DESC
+        LIMIT 10
+    ) TO 's3://{bucket}/gold/top_artistas.parquet' (FORMAT PARQUET);
 """
+con.sql(query_gold)
 
-con.sql(query_kpi)
-
-print("\n--- SUCESSO TOTAL! ---")
-print("Top 5 bandas dancantes:")
-con.sql(f"SELECT * FROM read_parquet('{LAKE_DIR}/gold/perfil_bandas.parquet') ORDER BY media_dancante DESC LIMIT 5").show()
-
-con.close()
+print("✅ Pipeline Nuvem finalizado com sucesso!")
